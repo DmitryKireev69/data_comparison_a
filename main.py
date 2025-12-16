@@ -1,12 +1,14 @@
 import pandas as pd
 from fuzzywuzzy import fuzz, process
 from openpyxl import load_workbook
-from openpyxl.styles import PatternFill
+from openpyxl.styles import PatternFill, Alignment
+from openpyxl.utils import get_column_letter
 import tkinter as tk
 from tkinter import filedialog, messagebox
 import warnings
 import os
 import sys
+import time
 
 # Отключаем все предупреждения
 warnings.filterwarnings('ignore')
@@ -15,7 +17,9 @@ warnings.filterwarnings('ignore')
 GREEN_FILL = PatternFill(start_color='C6EFCE', end_color='C6EFCE', fill_type='solid')  # Светло-зеленый
 YELLOW_FILL = PatternFill(start_color='FFEB9C', end_color='FFEB9C', fill_type='solid')  # Светло-желтый
 RED_FILL = PatternFill(start_color='FFC7CE', end_color='FFC7CE', fill_type='solid')  # Светло-красный
-NO_FILL = None  # Без заливки (для портала)
+
+# Стиль выравнивания по центру
+CENTER_ALIGNMENT = Alignment(horizontal='center', vertical='center')
 
 
 def normalize_name(fio):
@@ -36,6 +40,120 @@ def create_fio_from_columns(row):
     if pd.notna(row.get('Отчество')):
         parts.append(str(row['Отчество']).strip())
     return ' '.join(parts)
+
+
+def is_file_locked(filepath):
+    """Проверяет, заблокирован ли файл (открыт в другой программе)"""
+    import platform
+
+    if platform.system() == 'Windows':
+        try:
+            # На Windows пробуем открыть файл в режиме исключительного доступа
+            handle = os.open(filepath, os.O_RDWR | os.O_EXCL)
+            os.close(handle)
+            return False
+        except OSError:
+            return True
+    else:
+        # На Linux/Mac используем lsof
+        import subprocess
+        try:
+            subprocess.check_output(['lsof', filepath])
+            return True
+        except subprocess.CalledProcessError:
+            return False
+
+
+def adjust_column_width(ws):
+    """Автоматически настраивает ширину колонок с расширенными настройками"""
+    # Ширины для разных типов колонок
+    COLUMN_WIDTHS = {
+        'процент': 25,  # Процент совпадения
+        'источник': 15,  # Источник
+        'статус': 35,  # Статус совпадения (увеличен)
+        'фио': 45,  # ФИО
+        'совпадение': 45,  # Совпадение с порталом
+        'default': 20  # Остальные колонки
+    }
+
+    # Определяем ширину для каждой колонки
+    for column in ws.columns:
+        column_letter = get_column_letter(column[0].column)
+        column_name = str(ws[f"{column_letter}1"].value).lower() if ws[f"{column_letter}1"].value else ""
+
+        # Определяем тип колонки и устанавливаем ширину
+        width = COLUMN_WIDTHS['default']
+
+        if any(keyword in column_name for keyword in ['процент', '%']):
+            width = COLUMN_WIDTHS['процент']
+        elif 'источник' in column_name:
+            width = COLUMN_WIDTHS['источник']
+        elif any(keyword in column_name for keyword in ['статус', 'результат', 'проверки']):
+            width = COLUMN_WIDTHS['статус']
+        elif any(keyword in column_name for keyword in ['фио', 'фамилия', 'имя', 'отчество']):
+            width = COLUMN_WIDTHS['фио']
+        elif any(keyword in column_name for keyword in ['совпадение', 'match', 'соответствие']):
+            width = COLUMN_WIDTHS['совпадение']
+
+        ws.column_dimensions[column_letter].width = width
+
+        # Выравниваем заголовок по центру
+        ws[f"{column_letter}1"].alignment = CENTER_ALIGNMENT
+
+        # Для колонки статуса также выравниваем содержимое по центру
+        if 'статус' in column_name:
+            for row in range(2, ws.max_row + 1):
+                cell = ws[f"{column_letter}{row}"]
+                cell.alignment = CENTER_ALIGNMENT
+
+
+def save_with_formatting(filepath, df):
+    """Сохраняет DataFrame с форматированием"""
+    try:
+        # Сначала сохраняем без форматирования
+        df.to_excel(filepath, index=False)
+
+        # Теперь применяем форматирование
+        wb = load_workbook(filepath)
+        ws = wb.active
+
+        # Настраиваем ширину колонок
+        adjust_column_width(ws)
+
+        # Находим индекс колонки с процентами
+        header = [str(cell.value).strip() if cell.value else '' for cell in ws[1]]
+        percent_col_idx = None
+
+        for idx, col_name in enumerate(header, 1):
+            if 'процент' in str(col_name).lower():
+                percent_col_idx = idx
+                break
+
+        # Применяем выравнивание по центру для всей колонки процентов
+        if percent_col_idx:
+            col_letter = get_column_letter(percent_col_idx)
+            for row in range(2, ws.max_row + 1):
+                cell = ws[f"{col_letter}{row}"]
+                cell.alignment = CENTER_ALIGNMENT
+
+        # Применяем цветовую разметку
+        apply_coloring_to_worksheet(ws)
+
+        # Сохраняем изменения
+        wb.save(filepath)
+        print(f"Файл с форматированием сохранен: {filepath}")
+        return True
+
+    except Exception as e:
+        print(f"Ошибка при сохранении с форматированием: {e}")
+        # Пробуем сохранить без форматирования
+        try:
+            df.to_excel(filepath, index=False)
+            print(f"Файл сохранен без форматирования: {filepath}")
+            return True
+        except Exception as e2:
+            print(f"Ошибка при сохранении без форматирования: {e2}")
+            return False
 
 
 def process_excel_file(input_file, threshold=85):
@@ -215,17 +333,15 @@ def process_excel_file(input_file, threshold=85):
             'источник': original_row['источник'],
             'статус_совпадения': result_row['статус_совпадения'],
             'совпадение_с_порталом': result_row['совпадение_с_порталом'],
-            'процент_совпадения': result_row['процент_совпадения']
+            'процент_совпадения': result_row['процент_совпадения'],
+            'фио_в_зуп': result_row['фио_в_зуп']
         }
-
-        # Добавляем ФИО из ЗУП
-        output_row['фио_в_зуп'] = result_row['фио_в_зуп']
 
         # Добавляем остальные колонки
         for col in df.columns:
             col_lower = str(col).lower()
             if (col_lower in ['источник', 'фамилия', 'имя', 'отчество', '_temp_фио', 'источник_норм'] or
-                    'unnamed' in col_lower or 'фио' == col_lower):
+                    'unnamed' in col_lower):
                 continue
             if col not in output_row:
                 output_row[col] = original_row[col]
@@ -237,26 +353,37 @@ def process_excel_file(input_file, threshold=85):
 
     # Генерируем имя выходного файла
     base_name = os.path.splitext(input_file)[0]
-    output_file = f"{base_name}_результат.xlsx"
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    output_file = f"{base_name}_результат_{timestamp}.xlsx"
 
-    # Сохраняем результаты
+    # Сохраняем результаты с форматированием
     print(f"Сохранение результатов в: {output_file}")
-    final_df.to_excel(output_file, index=False)
 
-    # Применяем цветовую разметку
-    apply_coloring(output_file)
+    if is_file_locked(output_file) and os.path.exists(output_file):
+        # Если файл существует и заблокирован, создаем новый с другим именем
+        output_file = f"{base_name}_результат_{timestamp}_new.xlsx"
+        print(f"Создаю новый файл: {output_file}")
+
+    success = save_with_formatting(output_file, final_df)
+
+    if not success:
+        # Пробуем еще раз с другим именем
+        output_file = f"{base_name}_результат_{timestamp}_final.xlsx"
+        print(f"Пробую сохранить как: {output_file}")
+        success = save_with_formatting(output_file, final_df)
+
+        if not success:
+            raise Exception("Не удалось сохранить файл после нескольких попыток")
 
     return output_file, final_df
 
 
-def apply_coloring(file_path):
+def apply_coloring_to_worksheet(ws):
     """
-    Применяем цветовую разметку к Excel файлу
+    Применяем цветовую разметку к рабочему листу
     """
     try:
-        print(f"Начинаю раскраску файла: {file_path}")
-        wb = load_workbook(file_path)
-        ws = wb.active
+        print(f"Начинаю раскраску рабочего листа")
 
         # Находим индексы колонок по заголовкам
         header = []
@@ -324,19 +451,18 @@ def apply_coloring(file_path):
                         cell = ws.cell(row=row_num, column=col_num)
                         cell.fill = fill_color
                     colored_count += 1
-
-            # Для портала оставляем без заливки (удаляем любую существующую заливку)
             elif 'портал' in source_value:
-                for col_num in range(1, len(header) + 1):
-                    cell = ws.cell(row=row_num, column=col_num)
-                    cell.fill = PatternFill(fill_type=None)  # Удаляем заливку
+                # Для портала оставляем без заливки
+                pass
 
         print(f"Раскрашено строк ЗУП: {colored_count}")
         print(f"Всего строк в файле: {total_rows - 1}")
 
-        # Сохраняем изменения
-        wb.save(file_path)
-        print("Раскраска завершена успешно!")
+        # Добавляем автофильтр к заголовкам
+        if total_rows > 1:
+            ws.auto_filter.ref = ws.dimensions
+
+        print("Раскраска и форматирование завершены успешно!")
 
     except Exception as e:
         print(f"Ошибка при раскраске: {e}")
@@ -406,7 +532,7 @@ def show_results_window(output_file, df):
     """Показывает окно с результатами обработки"""
     root = tk.Tk()
     root.title("Результаты обработки")
-    root.geometry("600x500")
+    root.geometry("620x720")
 
     # Центрируем окно
     root.update_idletasks()
@@ -439,6 +565,14 @@ def show_results_window(output_file, df):
 
     tk.Button(file_frame, text="Открыть папку с файлом",
               command=open_folder).pack(pady=5)
+
+    # Кнопка для открытия файла
+    def open_file():
+        if os.path.exists(output_file):
+            os.startfile(output_file) if sys.platform == 'win32' else os.system(f'open "{output_file}"')
+
+    tk.Button(file_frame, text="Открыть файл с результатами",
+              command=open_file).pack(pady=5)
 
     # Статистика по ЗУП
     stats_frame = tk.LabelFrame(main_frame, text="Статистика для ЗУП", padx=10, pady=10)
@@ -499,6 +633,17 @@ def show_results_window(output_file, df):
         tk.Label(frame, text=color, font=("Arial", 10, "bold"),
                  width=35, anchor=tk.W).pack(side=tk.LEFT)
         tk.Label(frame, text=text).pack(side=tk.LEFT)
+
+    # Информация о форматировании
+    format_frame = tk.LabelFrame(main_frame, text="Форматирование файла", padx=10, pady=10)
+    format_frame.pack(fill=tk.X, pady=5)
+
+    tk.Label(format_frame, text="• Ширина колонок автоматически настроена",
+             font=("Arial", 9)).pack(anchor=tk.W)
+    tk.Label(format_frame, text="• Процент совпадения выровнен по центру",
+             font=("Arial", 9)).pack(anchor=tk.W)
+    tk.Label(format_frame, text="• Добавлен автофильтр к заголовкам",
+             font=("Arial", 9)).pack(anchor=tk.W)
 
     # Кнопка закрытия
     tk.Button(main_frame, text="Закрыть", command=root.destroy,
