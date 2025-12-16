@@ -70,7 +70,7 @@ def adjust_column_width(ws):
     COLUMN_WIDTHS = {
         'процент': 25,  # Процент совпадения
         'источник': 15,  # Источник
-        'статус': 35,  # Статус совпадения (увеличен)
+        'статус': 45,  # Статус совпадения (увеличен)
         'фио': 45,  # ФИО
         'совпадение': 45,  # Совпадение с порталом
         'default': 20  # Остальные колонки
@@ -225,7 +225,8 @@ def process_excel_file(input_file, threshold=85):
             if normalized:
                 portal_fios_dict[normalized] = {
                     'original_fio': fio,
-                    'row_idx': idx
+                    'row_idx': idx,
+                    'parts': normalized.split()  # Сохраняем разбитые части
                 }
 
     print(f"Создан словарь из портала: {len(portal_fios_dict)} уникальных ФИО")
@@ -250,6 +251,7 @@ def process_excel_file(input_file, threshold=85):
             continue
 
         normalized_zup = normalize_name(zup_fio)
+        zup_parts = normalized_zup.split()
 
         # Ищем точное совпадение
         exact_match = None
@@ -272,30 +274,136 @@ def process_excel_file(input_file, threshold=85):
             del portal_fios_dict[normalized_zup]
             continue
 
-        # Ищем лучшее нечеткое совпадение
+        # Ищем лучшее нечеткое совпадение с УЛУЧШЕННОЙ логикой
         best_match = ''
         best_score = 0
         best_key = None
 
         for portal_key, portal_data in portal_fios_dict.items():
-            score = fuzz.token_sort_ratio(normalized_zup, portal_key)
-            if score > best_score:
-                best_score = score
-                best_match = portal_data['original_fio']
-                best_key = portal_key
+            portal_parts = portal_data['parts']
 
+            # Основной расчет - token_sort_ratio для общей похожести
+            score = fuzz.token_sort_ratio(normalized_zup, portal_key)
+
+            # Теперь учитываем случаи, когда в портале нет отчества
+            # Если в ЗУП 3 части (Фамилия Имя Отчество), а в портале 2 части (Фамилия Имя)
+            if len(zup_parts) == 3 and len(portal_parts) == 2:
+                # Сравниваем фамилии
+                surname_match = fuzz.ratio(zup_parts[0], portal_parts[0])
+                # Сравниваем имена
+                name_match = fuzz.ratio(zup_parts[1], portal_parts[1])
+
+                # Если фамилия и имя хорошо совпадают, это может быть правильным совпадением
+                if surname_match >= 90 and name_match >= 90:
+                    # Рассчитываем специальную оценку для этого случая
+                    adjusted_score = (surname_match + name_match) / 2
+                    # Немного повышаем, так как отчество в портале может отсутствовать
+                    adjusted_score = min(95, adjusted_score + 5)
+
+                    if adjusted_score > best_score:
+                        best_score = adjusted_score
+                        best_match = portal_data['original_fio']
+                        best_key = portal_key
+                    continue
+
+            # Если в ЗУП 2 части (Фамилия Имя), а в портале 3 части (Фамилия Имя Отчество)
+            elif len(zup_parts) == 2 and len(portal_parts) == 3:
+                # Сравниваем фамилии
+                surname_match = fuzz.ratio(zup_parts[0], portal_parts[0])
+                # Сравниваем имена
+                name_match = fuzz.ratio(zup_parts[1], portal_parts[1])
+
+                # Если фамилия и имя хорошо совпадают
+                if surname_match >= 90 and name_match >= 90:
+                    # Рассчитываем специальную оценку
+                    adjusted_score = (surname_match + name_match) / 2
+                    adjusted_score = min(95, adjusted_score + 5)
+
+                    if adjusted_score > best_score:
+                        best_score = adjusted_score
+                        best_match = portal_data['original_fio']
+                        best_key = portal_key
+                    continue
+
+            # Для случаев, когда количество частей одинаковое
+            elif len(zup_parts) == len(portal_parts):
+                # Проверяем каждую часть
+                all_good = True
+                part_scores = []
+
+                for i in range(len(zup_parts)):
+                    part_score = fuzz.ratio(zup_parts[i], portal_parts[i])
+                    part_scores.append(part_score)
+
+                    # Фамилия должна совпадать хорошо
+                    if i == 0 and part_score < 80:
+                        all_good = False
+                        break
+                    # Имя должно совпадать хорошо
+                    elif i == 1 and part_score < 80:
+                        all_good = False
+                        break
+                    # Отчество может совпадать хуже, но не слишком плохо
+                    elif i == 2 and part_score < 50:
+                        all_good = False
+                        break
+
+                if all_good:
+                    # Рассчитываем средний балл
+                    adjusted_score = sum(part_scores) / len(part_scores)
+
+                    # Если отчество сильно отличается, снижаем оценку
+                    if len(zup_parts) == 3 and len(portal_parts) == 3:
+                        if part_scores[2] < 70:
+                            adjusted_score = adjusted_score * 0.85
+
+                    if adjusted_score > best_score:
+                        best_score = adjusted_score
+                        best_match = portal_data['original_fio']
+                        best_key = portal_key
+
+            # Общий расчет для остальных случаев
+            else:
+                if score > best_score:
+                    best_score = score
+                    best_match = portal_data['original_fio']
+                    best_key = portal_key
+
+        # Определяем статус совпадения
         if best_score >= threshold:
-            status = 'Частичное совпадение'
+            if best_key:
+                portal_parts = portal_fios_dict[best_key]['parts']
+
+                # Определяем тип совпадения
+                if len(zup_parts) == 3 and len(portal_parts) == 3:
+                    # Проверяем отчество
+                    patronymic_match = fuzz.ratio(zup_parts[2], portal_parts[2]) if len(zup_parts) > 2 and len(
+                        portal_parts) > 2 else 0
+                    if patronymic_match >= 95:
+                        status = 'Частичное совпадение'
+                    elif patronymic_match >= 70:
+                        status = 'Частичное совпадение (отчество отличается)'
+                    else:
+                        status = 'Частичное совпадение (разные отчества)'
+                elif len(zup_parts) == 3 and len(portal_parts) == 2:
+                    status = 'Частичное совпадение (в портале нет отчества)'
+                elif len(zup_parts) == 2 and len(portal_parts) == 3:
+                    status = 'Частичное совпадение (в ЗУП нет отчества)'
+                else:
+                    status = 'Частичное совпадение'
+            else:
+                status = 'Частичное совпадение'
         else:
             status = 'Совпадений не найдено'
             best_match = ''
+            best_score = 0
 
         results.append({
             'row_idx': idx,
             'источник': 'ЗУП',
             'фио_в_зуп': zup_fio,
             'совпадение_с_порталом': best_match,
-            'процент_совпадения': best_score,
+            'процент_совпадения': int(best_score) if best_match else 0,
             'статус_совпадения': status
         })
 
@@ -434,13 +542,22 @@ def apply_coloring_to_worksheet(ws):
 
             source_value = str(source_cell.value).lower() if source_cell.value else ''
             status_value = str(status_cell.value) if status_cell.value else ''
+            status_lower = status_value.lower()
 
             if 'зуп' in source_value:
-                if status_value == 'Полное совпадение':
+                # Проверяем ВСЕ типы частичных совпадений
+                if 'полное совпадение' in status_lower:
                     fill_color = GREEN_FILL
-                elif status_value == 'Частичное совпадение':
+                elif any(x in status_lower for x in [
+                    'частичное совпадение',
+                    'частичное',
+                    'совпадение (в портале нет отчества)',
+                    'совпадение (в зупе нет отчества)',
+                    'совпадение (отчество отличается)',
+                    'совпадение (разные отчества)'
+                ]):
                     fill_color = YELLOW_FILL
-                elif status_value in ['Совпадений не найдено', 'Пустое ФИО в ЗУП']:
+                elif any(x in status_lower for x in ['совпадений не найдено', 'пустое фио']):
                     fill_color = RED_FILL
                 else:
                     fill_color = None
